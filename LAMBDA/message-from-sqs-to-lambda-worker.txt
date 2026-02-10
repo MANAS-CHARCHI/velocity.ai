@@ -1,0 +1,7 @@
+{
+  "user_id": "test_user_001",
+  "subject_id": "manual_test",
+  "file_id": "test_doc.txt",
+  "chunk_index": 0,
+  "text": "The GridSwarm system uses a decentralized architecture to process vector embeddings at scale. This test ensures Bedrock Titan V2 is communicating with Pinecone."
+}
