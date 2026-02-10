@@ -1,0 +1,37 @@
+# RAG System Implementation - TODO
+
+## Phase 1: Local Setup & Infrastructure
+- [ ] Local Dev Environment: Set up Django project with PostgreSQL and React (Vite) frontend
+    - [ ] Create Django UserAPP
+    - [ ] Create Subjects APP with name, user_id, description, created_at
+    - [ ] Create the Documents APP with file_name, s3_key, status (processing, ready, error), subject_id
+    - [ ] Create the ChatSessions APP with title, created_at, subject_id, user_id
+    - [ ] Create the Message APP with role(user/assistant), content ( text ), timestamp, session_id
+
+    - [ ] React setup
+    - [ ] React setup for register, login
+    - [ ] React setup for create a subject and send the file(pdf, txt)
+- [ ] AWS Foundations: Create S3 buckets (Raw, Processed, Metadata)
+- [ ] AWS Foundations: Create SQS Queue
+- [ ] Vector Store: Set up Pinecone Serverless index (1024 dimensions for Bedrock Titan v2)
+
+## Phase 2: The Ingestion Pipeline (Upload Flow)
+- [ ] Backend Upload (Django): Create API endpoint for file uploads
+- [ ] Backend Upload (Django): Implement S3 upload with custom Metadata Headers
+- [ ] Manager Lambda: Write Python code to trigger on S3 upload
+- [ ] Manager Lambda: Read metadata, chunk text, send messages to SQS
+- [ ] Worker Lambda (Servant): Write code to consume SQS chunks
+- [ ] Worker Lambda (Servant): Get embeddings from Bedrock
+- [ ] Worker Lambda (Servant): Upsert embeddings to Pinecone
+
+## Phase 3: The Retrieval Pipeline (Query Flow)
+- [ ] Retrieval Lambda: Build Lambda to query Pinecone with metadata filters
+- [ ] Retrieval Lambda: Stream response from LLM (OpenAI/Gemini)
+- [ ] API Gateway: Set up REST API with Response Streaming enabled
+- [ ] API Gateway: Connect Backend to Retrieval Lambda
+- [ ] Backend Proxy (Django): Create Django view to call API Gateway
+- [ ] Backend Proxy (Django): Pipe the stream back to frontend
+
+## Phase 4: Frontend & Final Polish
+- [ ] React UI: Build chat interface
+- [ ] React UI: Display AI response word-by-word from stream

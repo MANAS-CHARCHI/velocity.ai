@@ -1,0 +1,12 @@
+# 1. Create a fresh directory
+mkdir lambda_package
+cd lambda_package
+
+# 2. Install dependencies directly into this folder
+pip install pinecone -t .
+
+# 3. Copy your lambda_function.py into this folder
+cp ../velocity-worker.py lambda_function.py
+
+# 4. Zip everything inside the folder
+zip -r ../velocity-lambda-worker.zip .
