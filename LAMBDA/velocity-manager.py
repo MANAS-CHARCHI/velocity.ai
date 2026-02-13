@@ -1,130 +1,88 @@
-import json
-import uuid
 import boto3
+import json
 import os
-import urllib.parse
-from io import StringIO
+import csv
+import io
 
 s3 = boto3.client('s3')
 sqs = boto3.client('sqs')
 textract = boto3.client('textract')
+lambda_client = boto3.client('lambda')
 
-QUEUE_URL = os.environ['SQS_QUEUE_URL']
-
-def smart_flush_to_sqs(buffer, metadata):
-    """Sends exactly what is in the buffer (up to 10) to SQS with batch safety"""
-    if not buffer:
-        return
-    
-    entries = []
-    for chunk_text in buffer:
-        # Merge metadata with the specific text chunk
-        body = {**metadata, "text": chunk_text, "chunk_id": str(uuid.uuid4())[:8]}
-        
-        # SQS Batch limit check (256KB total)
-        encoded_body = json.dumps(body)
-        if len(encoded_body.encode('utf-8')) > 250000:
-            print(f"Warning: Chunk in {metadata['filename']} too large, truncating.")
-            body["text"] = chunk_text[:100000]
-            encoded_body = json.dumps(body)
-
-        entries.append({
-            'Id': str(uuid.uuid4()),
-            'MessageBody': encoded_body
-        })
-    
-    try:
-        sqs.send_message_batch(QueueUrl=QUEUE_URL, Entries=entries)
-    except Exception as e:
-        print(f"SQS Batch Error: {e}")
-
-def get_metadata_from_key(key):
-    """Parses raw/user_id/subject_id/file_id/filename"""
-    parts = key.split('/')
-    if len(parts) >= 5:
-        return {
-            "user_id": parts[1],
-            "subject_id": parts[2],
-            "file_id": parts[3],
-            "filename": parts[4]
-        }
-    return {"user_id": "unknown", "subject_id": "unknown", "file_id": "unknown", "filename": parts[-1]}
-
-def smart_recursive_splitter(text, max_size=800, overlap=100):
-    """Splits text by Paragraphs -> Sentences -> Words to keep context alive."""
-    if not text: return []
-    
-    paragraphs = text.split("\n\n")
-    chunks = []
-    current_chunk = ""
-
-    for para in paragraphs:
-        if len(current_chunk) + len(para) <= max_size:
-            current_chunk += para + "\n\n"
-        else:
-            if current_chunk:
-                chunks.append(current_chunk.strip())
-            
-            # If paragraph is a monster, break it into sentences
-            if len(para) > max_size:
-                sentences = para.replace("? ", "?. ").replace("! ", "!. ").split(". ")
-                sub_chunk = ""
-                for sent in sentences:
-                    if len(sub_chunk) + len(sent) <= max_size:
-                        sub_chunk += sent + ". "
-                    else:
-                        if sub_chunk: chunks.append(sub_chunk.strip())
-                        sub_chunk = sent + ". "
-                current_chunk = sub_chunk
-            else:
-                current_chunk = para + "\n\n"
-
-    if current_chunk:
-        chunks.append(current_chunk.strip())
-    return chunks
+CROPPER_LAMBDA = os.environ['CROPPER_LAMBDA_NAME']
+WORKER_QUEUE_URL = os.environ['WORKER_SQS_URL']
+SNS_TOPIC_ARN = os.environ['TEXTRACT_SNS_TOPIC']
+ROLE_ARN = os.environ['TEXTRACT_ROLE_ARN']
 
 def lambda_handler(event, context):
-    for record in event['Records']:
-        raw_key = record['s3']['object']['key']
-        key = urllib.parse.unquote_plus(raw_key)
-        bucket = record['s3']['bucket']['name']
-        ext = key.split('.')[-1].lower()
+    # 1. Handle Textract Callback
+    if 'Records' in event and 'Sns' in event['Records'][0]:
+        return handle_textract_callback(event)
+    
+    # 2. Handle Direct S3 Uploads
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = event['Records'][0]['s3']['object']['key']
+    ext = key.split('.')[-1].lower()
+    meta = s3.head_object(Bucket=bucket, Key=key)['Metadata']
+
+    if ext == 'pdf':
+        textract.start_document_analysis(
+            DocumentLocation={'S3Object': {'Bucket': bucket, 'Name': key}},
+            FeatureTypes=["LAYOUT"],
+            NotificationChannel={'SNSTopicArn': SNS_TOPIC_ARN, 'RoleArn': ROLE_ARN}
+        )
+
+    elif ext == 'csv':
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        content = obj['Body'].read().decode('utf-8')
+        reader = list(csv.DictReader(io.StringIO(content)))
         
-        metadata = get_metadata_from_key(key)
-        metadata["file_type"] = ext
+        chunk_size = 20
+        chunks = [reader[i:i + chunk_size] for i in range(0, len(reader), chunk_size)]
+        total_parts = len(chunks)
         
-        extracted_text = ""
+        for idx, chunk in enumerate(chunks):
+            row_texts = [" | ".join([f"{col}: {val}" for col, val in r.items() if val]) for r in chunk]
+            send_to_worker(row_texts, meta, key, "csv", idx + 1, total_parts)
+            
+    elif ext == 'txt':
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        text = obj['Body'].read().decode('utf-8')
+        send_to_worker([text], meta, key, "text", 1, 1)
 
-        # --- SMART EXTRACTION ---
-        if ext in ['pdf', 'png', 'jpg', 'jpeg']:
-            response = textract.detect_document_text(
-                Document={'S3Object': {'Bucket': bucket, 'Name': key}}
-            )
-            extracted_text = "\n".join([b['Text'] for b in response['Blocks'] if b['BlockType'] == 'LINE'])
+    return {"status": "success"}
 
-        elif ext in ['txt', 'csv']:
-            # Stream the file content
-            response = s3.get_object(Bucket=bucket, Key=key)
-            extracted_text = response['Body'].read().decode('utf-8')
+def send_to_worker(content_list, meta, source_key, data_type, part_num, total_parts):
+    combined_content = "\n".join(content_list)
+    sqs.send_message(
+        QueueUrl=WORKER_QUEUE_URL,
+        MessageBody=json.dumps({
+            "type": data_type,
+            "content": combined_content,
+            "part_num": part_num,
+            "total_parts": total_parts,
+            "metadata": {**meta, "source_file": source_key}
+        })
+    )
 
-        else:
-            print(f"Skipping unsupported type: {ext}")
-            continue
-
-        # --- SMART CHUNKING & BATCHING ---
-        # We run the recursive splitter on the full extracted text
-        all_chunks = smart_recursive_splitter(extracted_text)
+def handle_textract_callback(event):
+    msg = json.loads(event['Records'][0]['Sns']['Message'])
+    job_id, bucket, key = msg['JobId'], msg['DocumentLocation']['S3Bucket'], msg['DocumentLocation']['S3ObjectName']
+    meta = s3.head_object(Bucket=bucket, Key=key)['Metadata']
+    response = textract.get_document_analysis(JobId=job_id)
+    
+    # Aggregate LINEs by Page
+    pages = {}
+    for block in response['Blocks']:
+        if block['BlockType'] == 'LAYOUT_FIGURE':
+            lambda_client.invoke(FunctionName=CROPPER_LAMBDA, InvocationType='Event',
+                                Payload=json.dumps({"bucket": bucket, "key": key, "metadata": meta, 
+                                                   "bbox": block['Geometry']['BoundingBox'], "page": block.get('Page', 1), "id": block['Id']}))
         
-        sqs_buffer = []
-        for chunk in all_chunks:
-            sqs_buffer.append(chunk)
-            # Flush every 10 chunks (Smart Batching)
-            if len(sqs_buffer) == 10:
-                smart_flush_to_sqs(sqs_buffer, metadata)
-                sqs_buffer = []
+        elif block['BlockType'] == 'LINE':
+            p_num = block.get('Page', 1)
+            pages.setdefault(p_num, []).append(block['Text'])
 
-        # Final flush for remaining chunks (<10)
-        if sqs_buffer:
-            smart_flush_to_sqs(sqs_buffer, metadata)
-
-    return {"status": "Complete", "total_records": len(event['Records'])}
+    total_pages = len(pages)
+    for p_num, lines in pages.items():
+        send_to_worker(lines, meta, key, "pdf_page", p_num, total_pages)

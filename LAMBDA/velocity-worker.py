@@ -3,59 +3,64 @@ import os
 import boto3
 from pinecone import Pinecone
 
-# Initialize clients outside the handler for reuse (Fast execution)
 bedrock = boto3.client('bedrock-runtime')
+s3 = boto3.client('s3')
 pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
 index = pc.Index(os.environ['PINECONE_INDEX_NAME'])
 
+VAULT_BUCKET = os.environ['VAULT_BUCKET']
+METADATA_BUCKET = os.environ['METADATA_BUCKET']
+
 def lambda_handler(event, context):
-    # event['Records'] contains 1 to 10 SQS messages
-    vectors_to_upsert = []
-    
     for record in event['Records']:
         try:
-            # Parse SQS Message
             body = json.loads(record['body'])
-            text = body['text']
-            metadata = {
-                "user_id": body['user_id'],
-                "subject_id": body['subject_id'],
-                "file_id": body['file_id'],
-                "text": text[:1000] # Pinecone metadata limit is 40KB; don't store huge text
-            }
-            
-            # 1. Get Embedding from Bedrock
-            bedrock_payload = json.dumps({
-                "inputText": text,
-                "dimensions": 1024,
-                "normalize": True
-            })
-            
-            response = bedrock.invoke_model(
-                body=bedrock_payload,
-                modelId=os.environ['BEDROCK_MODEL_ID'],
-                accept='application/json',
-                contentType='application/json'
-            )
-            
-            response_body = json.loads(response.get('body').read())
-            embedding = response_body.get('embedding')
-            
-            # 2. Prepare Vector Object
-            vector_id = f"{body['file_id']}#{body['chunk_index']}"
-            vectors_to_upsert.append({
-                "id": vector_id,
-                "values": embedding,
-                "metadata": metadata
-            })
-            
-        except Exception as e:
-            print(f"Error processing record {record['messageId']}: {str(e)}")
-            # In production, you'd report this as a batch failure
-    
-    # 3. Batch Upsert to Pinecone
-    if vectors_to_upsert:
-        index.upsert(vectors=vectors_to_upsert)
-        print(f"Successfully upserted {len(vectors_to_upsert)} vectors.")
+            content = body['content']
+            meta = body['metadata']
+            file_id = meta['file_id']
+            part_num = body['part_num']
+            total_parts = body['total_parts']
 
-    return {"statusCode": 200}
+            # 1. Pinecone Vector
+            res = bedrock.invoke_model(
+                body=json.dumps({"inputText": content, "dimensions": 1024, "normalize": True}),
+                modelId='amazon.titan-embed-text-v2:0', accept='application/json', contentType='application/json'
+            )
+            embedding = json.loads(res.get('body').read()).get('embedding')
+            
+            index.upsert(vectors=[{
+                "id": f"{file_id}#{part_num}",
+                "values": embedding,
+                "metadata": {**meta, "text": content[:1000]}
+            }])
+
+            # 2. Save Part to Temp Folder (Zero overwrite)
+            temp_key = f"temp/{file_id}/part_{part_num:05}.txt"
+            s3.put_object(Bucket=VAULT_BUCKET, Key=temp_key, Body=content)
+
+            # 3. If Last Part, Assemble File
+            if part_num == total_parts:
+                assemble_final_file(file_id, meta)
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+def assemble_final_file(file_id, meta):
+    # 1. List and sort all parts
+    prefix = f"temp/{file_id}/"
+    objs = s3.list_objects_v2(Bucket=VAULT_BUCKET, Prefix=prefix)['Contents']
+    sorted_objs = sorted(objs, key=lambda x: x['Key'])
+    
+    # 2. Join text
+    full_text = []
+    for obj in sorted_objs:
+        txt = s3.get_object(Bucket=VAULT_BUCKET, Key=obj['Key'])['Body'].read().decode('utf-8')
+        full_text.append(txt)
+    
+    # 3. Final Vault Write (ONE write only)
+    vault_key = f"vault/{meta['user_id']}/{meta['subject_id']}/{file_id}.txt"
+    s3.put_object(Bucket=VAULT_BUCKET, Key=vault_key, Body="\n\n".join(full_text))
+    
+    # 4. Cleanup Temp
+    for obj in sorted_objs:
+        s3.delete_object(Bucket=VAULT_BUCKET, Key=obj['Key'])
